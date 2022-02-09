@@ -1,6 +1,7 @@
 try:
     import i18n
     import locale
+
     _ = i18n.t
     lc, encoding = locale.getdefaultlocale()
 
@@ -146,7 +147,7 @@ def _base___getattr__(self, item):
     item = getattr(self.__class__, item)
     import inspect
     if item and \
-             (inspect.signature(item).parameters and list(inspect.signature(item).parameters)[0] == 'instance'):
+            (inspect.signature(item).parameters and list(inspect.signature(item).parameters)[0] == 'instance'):
         def instance_wrapper(*args, **kwargs):
             return item(self, *args, **kwargs)
 
