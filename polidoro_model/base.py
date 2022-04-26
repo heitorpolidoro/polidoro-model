@@ -1,8 +1,15 @@
+import re
+from functools import lru_cache
+
+from polidoro_question.question import Question
+
 try:
     import i18n
     import locale
 
-    _ = i18n.t
+    @lru_cache
+    def _(text):
+        return i18n.t(text)
     lc, encoding = locale.getdefaultlocale()
 
     i18n.set('locale', lc)
@@ -16,7 +23,7 @@ except ImportError:
 import os
 
 from sqlalchemy import create_engine, inspect
-from sqlalchemy.orm import declarative_base, DeclarativeMeta, sessionmaker, Query
+from sqlalchemy.orm import declarative_base, DeclarativeMeta, sessionmaker, Query, RelationshipProperty, ColumnProperty
 from string import Template
 
 
@@ -26,27 +33,30 @@ class BaseType(DeclarativeMeta):
 
     __str_attributes__ = None
     __custom_str__ = None
+    __translate_values__ = False
+    __print_as_table__ = False
+    __default_filter_attribute__ = None
+    __all__ = []
 
     def __init__(cls, class_name, *args, **kwargs):
         super(BaseType, cls).__init__(class_name, *args, **kwargs)
-        if class_name != 'Base':
-            if BaseType.session is None:
-                engine = create_engine(os.environ.get('DB_URL', ''))
-                session = sessionmaker()
-                session.configure(bind=engine)
-                Base.metadata.create_all(engine)
-                BaseType.session = session()
 
-    def attributes(cls):
+    def attributes(cls, ignore_relationship=False):
         """Return a list(str) of the attributes"""
-        return [a.key for a in inspect(cls).attrs]
+        attributes = []
+        for a in inspect(cls).attrs:
+            if ignore_relationship and isinstance(a, RelationshipProperty):
+                continue
+            attributes.append(a.key)
+        return attributes
 
-    def create(cls, **attributes):
+    def create(cls, ask_for_none_values=True, **attributes):
         """Create an instance of Model with initial attributes"""
         instance = cls(**attributes)
-        for attr in cls.attributes():
-            if attr != 'id' and getattr(instance, attr) is None:
-                instance.ask_attribute(attr)
+        if ask_for_none_values:
+            for attr in cls.attributes():
+                if not attr.endswith('id') and getattr(instance, attr) is None:
+                    instance.ask_attribute(attr)
         return instance
 
     def filter(cls, *args, **kwargs):
@@ -58,29 +68,124 @@ class BaseType(DeclarativeMeta):
 
         for attr, value in kwargs.items():
             column = getattr(cls, attr)
-            if '%' in value:
+            if value == 'None':
+                value = None
+            if value is not None and not isinstance(value, Base) and isinstance(column.property, RelationshipProperty):
+                clazz = column.property.entity.class_
+                default_attribute = getattr(clazz, '__default_filter_attribute__', None)
+                value = clazz.filter(**{default_attribute: value}).first()
+            if isinstance(value, str) and '%' in value:
                 query = query.filter(column.like(value))
+            elif isinstance(value, tuple):
+                query = query.filter(column.between(*value))
             else:
                 query = query.filter(column == value)
         return query
 
-    def print(cls, *args, **kwargs):
+    def print(cls, *args, attributes=None, **kwargs):
         """Prints a list of instances filtered"""
         if args and isinstance(args[0], (list, Query)):
             entities = args[0]
         else:
             entities = cls.filter(*args, **kwargs)
-        for e in entities:
-            print(e)
+        if cls.__print_as_table__:
+            from polidoro_table import Table
+            t = Table(_(cls.__name__))
+            if not attributes:
+                if hasattr(cls, '__table_attributes__'):
+                    attributes = getattr(cls, '__table_attributes__')
+                else:
+                    attributes = [a.replace('_id', '') for a in cls.attributes(ignore_relationship=True)]
+            t.add_columns([_(a) for a in attributes])
+
+            attributes_to_translate = cls.attributes_to_translate()
+
+            for e in entities:
+                row = []
+                for a in attributes:
+                    value = getattr(e, a, None)
+                    if a in attributes_to_translate:
+                        if isinstance(value, Base):
+                            value = _base___str__(value, template=getattr(value, '__table_str__', None))
+                        value = _(str(value))
+                    row.append(value)
+                t.add_row(row)
+            t.print()
+        else:
+            for e in entities:
+                print(e)
+
+    def attributes_to_translate(cls):
+        if cls.__translate_values__:
+            if isinstance(cls.__translate_values__, list):
+                attributes_to_translate = cls.__translate_values__
+            else:
+                attributes_to_translate = cls.attributes()
+        else:
+            attributes_to_translate = []
+        return attributes_to_translate
+
+    def all(cls):
+        if not cls.__all__:
+            cls.__all__ = cls.filter()
+        return cls.__all__
 
     @staticmethod
-    def ask_attribute(instance, attribute):
+    def init_db():
+        engine = create_engine(os.environ.get('DB_URL', ''))
+        session = sessionmaker()
+        session.configure(bind=engine)
+        Base.metadata.create_all(engine)
+        BaseType.session = session()
+
+    @staticmethod
+    def ask_attribute(instance, attribute, default=None):
         """Ask for an attribute, in terminal, and set in the instance."""
-        default = getattr(instance, attribute, None)
-        default_str = '' if default is None else f'({default})'
-        value = BaseType._input(f'{attribute}{default_str}: ')
-        if value == '':
-            value = default
+        attribute_property = inspect(instance.__class__).attrs[attribute]
+        attributes_options = getattr(instance.__class__, '__attributes_options__', {})
+        auto_complete = False
+        if isinstance(attribute_property, RelationshipProperty):
+            model = get_model(attribute_property.argument)
+            options_list = model.all()
+            option_str = getattr(model, '__option_str__', None)
+            options = {}
+            if list(attribute_property.local_columns)[0].nullable:
+                options[_('none').capitalize()] = None
+            for o in options_list:
+                if option_str:
+                    options[_base___str__(o, option_str)] = o
+                else:
+                    options[str(o)] = o
+            options[_('create').capitalize()] = 'create'
+            attributes_options[attribute] = options
+            column_type = model
+            auto_complete = True
+        elif isinstance(attribute_property, ColumnProperty):
+            column = attribute_property.columns[0]
+            column_type = column.type.python_type
+            if default is None:
+                default = getattr(instance, attribute, None)
+                if default is None and column.default:
+                    default = column.default.arg
+
+        value = Question(f'{_(attribute).capitalize()}',
+                         default=default,
+                         type=column_type,
+                         options=attributes_options.get(attribute, None),
+                         auto_complete=auto_complete
+                         ).ask()
+        if value == 'create':
+            value = model.create()
+            value.save()
+        instance.set_attribute(attribute, value)
+
+    @staticmethod
+    def set_attributes(instance, **attributes):
+        for attr, value in attributes.items():
+            instance.set_attribute(attr, value)
+
+    @staticmethod
+    def set_attribute(instance, attribute, value):
         setattr(instance, attribute, value)
 
     @staticmethod
@@ -90,53 +195,78 @@ class BaseType(DeclarativeMeta):
         BaseType.session.add(instance)
         if commit:
             BaseType.session.commit()
+            BaseType.session.refresh(instance)
+        instance.__class__.__all__ = []
+        return instance
 
     @staticmethod
-    def edit(instance):
+    def edit(instance, set=None):
         """Ask for each instance attribute for a new value, with the old value as default"""
-        for attr in instance.attributes():
-            if attr != 'id':
-                instance.ask_attribute(attr)
+        if set:
+            attributes = {}
+            for attr_value in set.split(','):
+                attr, value = attr_value.split('=')
+                attributes[attr] = value
+            instance.set_attributes(**attributes)
+        else:
+            for attr in instance.attributes():
+                if not attr.endswith('id'):
+                    instance.ask_attribute(attr)
         instance.save()
 
-    @staticmethod
-    def delete(instance, commit=True):
+    def delete(cls, instance=None, commit=True, **kwargs):
         """Delete the instance (SQLAlchemy session.delete(instance)) and commit (SQLAlchemy session.commit())
          if `commit` is `True."""
-        BaseType.session.delete(instance)
+        if instance is None:
+            cls.filter(**kwargs).delete()
+        else:
+            BaseType.session.delete(instance)
 
         if commit:
             BaseType.session.commit()
-
-    @staticmethod
-    def _input(prompt=None):
-        return input(prompt)
-
-    @staticmethod
-    def _boolean_input(message, default=True):
-        options = 'Y/n' if default else 'y/N'
-        resp = input(f'{message} [{options}]: ')
-        if not resp:
-            return default
-        return resp.lower() == 'y'
+            cls.__all__ = []
 
 
 Base = declarative_base(metaclass=BaseType)
 
 
-def _base___str__(self):
-    if self.__custom_str__:
-        template_values = {'class': _(self.__class__.__name__)}
-        template_values.update(self.__dict__)
-        template_values = {k: v for k, v in template_values.items() if not k.startswith('_sa')}
-        return Template(self.__custom_str__).substitute(**template_values)
-    else:
-        attributes = self.__str_attributes__ or self.attributes()
-        attributes_values = ', '.join(
-            f'{_(attr).upper()}: {getattr(self, attr)}' for attr in attributes
-        )
+@lru_cache
+def _base___str__(self, template=None):
+    if template is None:
+        template = self.__custom_str__
 
-        return f'<{_(self.__class__.__name__)}({attributes_values})>'
+    translated_class_name = _(self.__class__.__name__)
+    translated_values = {'class': translated_class_name}
+    attributes_to_translate = self.attributes_to_translate()
+    attributes = self.__str_attributes__ or self.attributes()
+    for attribute in attributes:
+        if not attribute.startswith('_sa'):
+            v = getattr(self, attribute)
+            if attribute in attributes_to_translate:
+                v = _(str(v))
+            if attribute.endswith('_id'):
+                attribute_instance = attribute[:-3]
+                translated_values[attribute_instance] = getattr(self, attribute_instance)
+        translated_values[attribute] = v
+    if template:
+        instance_info = re.findall(r'\$\(.*?\)', template)
+        for ii in instance_info:
+            key = ii[2:-1]
+            value = self
+            for k in key.split('.'):
+                value = getattr(value, k)
+                if value is None:
+                    break
+            template = template.replace(ii, str(value))
+        substitute = Template(template).substitute(**translated_values)
+        return substitute
+    else:
+        attributes_values = []
+        for attr in attributes:
+            value = translated_values.get(attr, None)
+            if value is not None:
+                attributes_values.append(f'{_(attr).upper()}: {value}')
+        return f'<{translated_class_name}({", ".join(attributes_values)})>'
 
 
 def _base___repr__(self):
@@ -172,7 +302,7 @@ def get_model(model_name: str):
 
     """
     for sub_class in Base.__subclasses__():
-        if model_name == sub_class.__name__.lower():
+        if model_name.lower() == sub_class.__name__.lower():
             return sub_class
     raise Exception(f'Model "{model_name}" not found!')
 
